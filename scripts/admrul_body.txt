@@ -1,0 +1,30 @@
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+    r = requests.get('httpsL//www.law.go.kr/DRF/lawService.do', params={
+    'OC':'yunseong', 'type':'XML', 'target':'admrul', 'ID':'2100000255844'
+    })
+  File "C:\Users\SGI\documents\git\law_collector\venv\Lib\site-packages\requests\api.py", line 87, in get
+    return request("get", url, params=params, **kwargs)
+  File "C:\Users\SGI\documents\git\law_collector\venv\Lib\site-packages\requests\api.py", line 71, in request
+    return session.request(method=method, url=url, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SGI\documents\git\law_collector\venv\Lib\site-packages\requests\sessions.py", line 635, in request
+    prep = self.prepare_request(req)
+  File "C:\Users\SGI\documents\git\law_collector\venv\Lib\site-packages\requests\sessions.py", line 541, in prepare_request
+    p.prepare(
+    ~~~~~~~~~^
+        method=method.upper(),
+        ^^^^^^^^^^^^^^^^^^^^^^
+    ...<10 lines>...
+        hooks=merge_hooks(request.hooks, self.hooks),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\SGI\documents\git\law_collector\venv\Lib\site-packages\requests\models.py", line 439, in prepare
+    self.prepare_url(url, params)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\SGI\documents\git\law_collector\venv\Lib\site-packages\requests\models.py", line 514, in prepare_url
+    raise MissingSchema(
+    ...<2 lines>...
+    )
+requests.exceptions.MissingSchema: Invalid URL 'httpsL//www.law.go.kr/DRF/lawService.do': No scheme supplied. Perhaps you meant https://httpsL//www.law.go.kr/DRF/lawService.do?

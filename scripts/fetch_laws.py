@@ -1,17 +1,18 @@
 """
 fetch_laws.py
 -------------
-법제처 국가법령정보 Open API를 이용하여
-여객자동차 운수사업법 관련 법령·행정규칙·자치법규를
-Markdown 파일로 수집·저장합니다.
+법제처 국가법령정보 Open API를 이용하여 여객자동차 운수사업법 관련
+법령·행정규칙·자치법규를 Markdown 파일로 수집·저장합니다.
 
-변동 감지 방식:
-  docs/.manifest.json 에 {mst: 시행일자} 를 보관.
-  API에서 받은 시행일자와 비교하여 변경된 건만 본문 재수집.
-  변경 없으면 파일 미수정 → git diff 없음 → 커밋 없음.
+본문조회 식별자 (실측 확정):
+  law    : 법령일련번호  -> MST
+  admrul : 행정규칙일련번호 -> ID
+  ordin  : 자치법규일련번호 -> ID
 
-API 문서: https://open.law.go.kr/LSO/openApi/guideList.do
-실행 전 환경변수 LAW_API_KEY 설정 필요
+본문 XML 구조 (실측 확정):
+  law    : <조문> 안 조문번호/항/호/목
+  admrul : <조문내용> 통짜 텍스트 여러 개
+  ordin  : <조문> 안 <조>(<조제목>/<조내용>) + <부칙>/<부칙내용>
 """
 
 import json
@@ -32,11 +33,19 @@ import requests
 API_KEY   = os.environ["LAW_API_KEY"]
 BASE_URL  = "https://www.law.go.kr/DRF"
 OUTPUT    = Path("docs")
-MANIFEST  = OUTPUT / ".manifest.json"   # 변동 감지용 스냅샷
+MANIFEST  = OUTPUT / "manifest.json"
 DELAY_SEC = 0.5
+RETRIES   = 3
 LOG_LEVEL = logging.INFO
 
 SEARCH_KEYWORDS = ["여객자동차", "노선버스", "준공영제"]
+
+# target별 메타 (실측 확정)
+TARGET_META = {
+    "law":    {"item": "law",    "id_tag": "법령일련번호",     "body_key": "MST", "name": "법령명한글",  "region": None},
+    "admrul": {"item": "admrul", "id_tag": "행정규칙일련번호", "body_key": "ID",  "name": "행정규칙명",  "region": None},
+    "ordin":  {"item": "law",    "id_tag": "자치법규일련번호", "body_key": "ID",  "name": "자치법규명",  "region": "지자체기관명"},
+}
 
 # ─────────────────────────────────────────
 # 로거
@@ -56,7 +65,6 @@ log = logging.getLogger(__name__)
 # 매니페스트 (변동 감지)
 # ─────────────────────────────────────────
 def load_manifest() -> dict:
-    """이전 수집 시 저장한 {mst: enforcement_date} 딕셔너리."""
     if MANIFEST.exists():
         return json.loads(MANIFEST.read_text(encoding="utf-8"))
     return {}
@@ -66,36 +74,43 @@ def save_manifest(manifest: dict):
     OUTPUT.mkdir(exist_ok=True)
     MANIFEST.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
 
 def has_changed(mst: str, new_date: str, manifest: dict) -> bool:
-    """시행일자가 달라졌거나 신규 항목이면 True."""
     return manifest.get(mst) != new_date
 
 
 # ─────────────────────────────────────────
 # API 호출 공통
 # ─────────────────────────────────────────
-def api_get(endpoint: str, params: dict) -> ET.Element | None:
-    params.update({"OC": API_KEY, "type": "XML"})
+def api_get(endpoint: str, params: dict):
+    params = {**params, "OC": API_KEY, "type": "XML"}
     url = f"{BASE_URL}/{endpoint}.do"
-    try:
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        resp.encoding = "utf-8"
-        return ET.fromstring(resp.text)
-    except Exception as e:
-        log.warning(f"API 호출 실패 [{endpoint}] params={params}: {e}")
-        return None
+    for attempt in range(RETRIES):
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            resp.encoding = "utf-8"
+            time.sleep(DELAY_SEC)
+            return ET.fromstring(resp.text)
+        except requests.exceptions.ConnectionError:
+            wait = 2 * (attempt + 1)
+            log.warning(f"연결 끊김 [{endpoint}] {attempt+1}/{RETRIES} - {wait}s 후 재시도")
+            time.sleep(wait)
+        except Exception as e:
+            log.warning(f"API 호출 실패 [{endpoint}] params={params}: {e}")
+            return None
+    log.warning(f"재시도 초과 [{endpoint}] params={params}")
+    return None
 
 
 # ─────────────────────────────────────────
 # 목록 조회
 # ─────────────────────────────────────────
-def fetch_list(target: str, item_tag: str, mst_tag: str,
-               name_tag: str, keyword: str) -> list[dict]:
+def fetch_list(target: str, keyword: str) -> list:
+    meta = TARGET_META[target]
     items, page = [], 1
     while True:
         root = api_get("lawSearch", {
@@ -104,68 +119,67 @@ def fetch_list(target: str, item_tag: str, mst_tag: str,
         })
         if root is None:
             break
-        nodes = root.findall(f".//{item_tag}")
+
+        nodes = root.findall(f".//{meta['item']}")
         if not nodes:
             break
+
         for node in nodes:
+            mst = _text(node, meta["id_tag"])
+            if not mst:
+                continue
             items.append({
                 "type":   target,
-                "mst":    _text(node, mst_tag),
-                "name":   _text(node, name_tag),
+                "mst":    mst,
+                "name":   _text(node, meta["name"]),
                 "date":   _text(node, "시행일자"),
-                "region": _text(node, "자치단체명"),  # 자치법규만 값 있음
+                "region": _text(node, meta["region"]) if meta["region"] else "",
             })
+
+        total = int(root.findtext("totalCnt") or 0)
+        if page * 100 >= total or len(nodes) < 100:
+            break
         page += 1
         time.sleep(DELAY_SEC)
-        if len(nodes) < 100:
-            break
+
     return items
 
 
-def collect_all_lists() -> list[dict]:
-    configs = [
-        ("law",    "law",    "법령MST",      "법령명한글"),
-        ("admrul", "admrul", "행정규칙MST",   "행정규칙명"),
-        ("ordin",  "ordin",  "자치법규MST",   "자치법규명"),
-    ]
-    all_items: list[dict] = []
+def collect_all_lists() -> list:
+    all_items = []
     for kw in SEARCH_KEYWORDS:
         log.info(f"  키워드 [{kw}] 목록 조회 중...")
-        for target, tag, mst_tag, name_tag in configs:
-            all_items += fetch_list(target, tag, mst_tag, name_tag, kw)
+        for target in TARGET_META:
+            all_items += fetch_list(target, kw)
         time.sleep(DELAY_SEC)
     return deduplicate(all_items)
 
 
 # ─────────────────────────────────────────
-# 본문 조회 → Markdown
+# 본문 조회 -> Markdown
 # ─────────────────────────────────────────
-TARGET_MAP = {
-    "law":    "law",
-    "admrul": "admrul",
-    "ordin":  "ordin",
-}
-
-def fetch_body(item: dict) -> str | None:
+def fetch_body(item: dict):
+    meta = TARGET_META[item["type"]]
     root = api_get("lawService", {
-        "target": TARGET_MAP[item["type"]],
-        "MST":    item["mst"],
+        "target": item["type"],
+        meta["body_key"]: item["mst"],
     })
     return xml_to_markdown(root) if root is not None else None
 
 
 # ─────────────────────────────────────────
-# XML → Markdown
+# XML -> Markdown
 # ─────────────────────────────────────────
 def xml_to_markdown(root: ET.Element) -> str:
     name = (root.findtext(".//법령명한글")
             or root.findtext(".//행정규칙명")
             or root.findtext(".//자치법규명")
             or "법령")
-    promulgation = root.findtext(".//공포일자") or ""
+    promulgation = root.findtext(".//공포일자") or root.findtext(".//발령일자") or ""
     enforcement  = root.findtext(".//시행일자") or ""
     law_no       = (root.findtext(".//법령번호")
-                    or root.findtext(".//공포번호") or "")
+                    or root.findtext(".//공포번호")
+                    or root.findtext(".//발령번호") or "")
 
     lines = [
         f"# {name}\n",
@@ -175,33 +189,79 @@ def xml_to_markdown(root: ET.Element) -> str:
         "---\n",
     ]
 
+    body = []
+
+    # (1) 법령식 정형 구조 <조문> > 조문번호/항/호/목
     for jo in root.iter("조문"):
+        has_jomun = False
+        for child in jo:
+            if child.tag == "조문번호" or child.tag == "조문내용":
+                has_jomun = True
+                break
+        if not has_jomun:
+            continue
         jo_no      = jo.findtext("조문번호") or ""
         jo_title   = jo.findtext("조문제목") or ""
         jo_content = jo.findtext("조문내용") or ""
+        if not (jo_no or jo_content):
+            continue
 
         heading = f"## 제{jo_no}조" + (f" ({jo_title})" if jo_title else "")
-        lines.append(heading)
+        body.append(heading)
         if jo_content:
-            lines.append(_clean(jo_content) + "\n")
+            body.append(_clean(jo_content) + "\n")
 
         for hang in jo.iter("항"):
             hang_no      = hang.findtext("항번호") or ""
             hang_content = hang.findtext("항내용") or ""
             if hang_content:
-                lines.append(f"**{hang_no}항** {_clean(hang_content)}")
+                body.append(f"**{hang_no}항** {_clean(hang_content)}")
             for ho in hang.iter("호"):
                 ho_no      = ho.findtext("호번호") or ""
                 ho_content = ho.findtext("호내용") or ""
                 if ho_content:
-                    lines.append(f"  - {ho_no}. {_clean(ho_content)}")
-                for mok in ho.iter("목"):
-                    mok_no      = mok.findtext("목번호") or ""
-                    mok_content = mok.findtext("목내용") or ""
-                    if mok_content:
-                        lines.append(f"    - {mok_no}) {_clean(mok_content)}")
-        lines.append("")
+                    body.append(f"  - {ho_no} {_clean(ho_content)}")
+        body.append("")
 
+    # (2) ordin 식: <조> 안 <조제목>/<조내용>
+    if not body:
+        for jo in root.iter("조"):
+            title   = jo.findtext("조제목") or ""
+            content = jo.findtext("조내용") or ""
+            if not content:
+                continue
+            head = f"## {_clean(content).split(')')[0]})" if content.strip().startswith("제") and ")" in content else (f"## {title}" if title else "##")
+            body.append(f"## {title}" if title else "## 조문")
+            body.append(_clean(content) + "\n")
+        # 부칙
+        for bc in root.iter("부칙내용"):
+            txt = (bc.text or "").strip()
+            if txt:
+                body.append("## 부칙")
+                body.append(_clean(txt) + "\n")
+
+    # (3) admrul 식: <조문내용> 통짜 텍스트
+    if not body:
+        for jo in root.iter("조문내용"):
+            txt = (jo.text or "").strip()
+            if not txt:
+                continue
+            m = re.match(r"^(제\s*\d+조(?:의\d+)?)\s*\(([^)]*)\)\s*(.*)", txt, re.S)
+            if m:
+                jo_head, jo_title, rest = m.group(1), m.group(2), m.group(3)
+                body.append(f"## {jo_head} ({jo_title})")
+                if rest.strip():
+                    body.append(_clean(rest) + "\n")
+            else:
+                body.append(_clean(txt) + "\n")
+
+    # (4) 최후 fallback
+    if not body:
+        for el in root.iter():
+            if el.text and el.text.strip() and el.tag not in ("행정규칙명", "자치법규명", "법령명한글"):
+                body.append(_clean(el.text))
+
+    lines += body
     return "\n".join(lines)
 
 
@@ -215,7 +275,7 @@ def save_markdown(subdir: str, filename: str, content: str):
     log.info(f"    저장: {subdir}/{filename}")
 
 
-def build_index(all_items: list[dict], generated_at: str,
+def build_index(all_items: list, generated_at: str,
                 changed: int, skipped: int) -> str:
     lines = [
         "# 여객자동차 운수사업법 관련 법령 아카이브\n",
@@ -223,7 +283,7 @@ def build_index(all_items: list[dict], generated_at: str,
         f"> 총 {len(all_items)}건 (변경 {changed}건 / 미변경 스킵 {skipped}건)\n",
         "---\n",
     ]
-    for cat, label in [("law","📘 법령"),("admrul","📙 행정규칙"),("ordin","📗 자치법규")]:
+    for cat, label in [("law", "법령"), ("admrul", "행정규칙"), ("ordin", "자치법규")]:
         subset = [i for i in all_items if i["type"] == cat]
         if not subset:
             continue
@@ -243,19 +303,25 @@ def build_index(all_items: list[dict], generated_at: str,
 # 유틸
 # ─────────────────────────────────────────
 def _text(el: ET.Element, tag: str) -> str:
+    if not tag:
+        return ""
     node = el.find(tag)
     return node.text.strip() if node is not None and node.text else ""
 
+
 def _clean(t: str) -> str:
-    return re.sub(r"\s+", " ", t).strip()
+    return re.sub(r"[ \t]+", " ", t).strip()
+
 
 def _fmt_date(d: str) -> str:
     return f"{d[:4]}.{d[4:6]}.{d[6:]}" if len(d) == 8 else d
 
+
 def safe_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", name)[:100]
 
-def deduplicate(items: list[dict]) -> list[dict]:
+
+def deduplicate(items: list) -> list:
     seen, result = set(), []
     for item in items:
         key = (item["type"], item["mst"])
@@ -272,16 +338,13 @@ def main():
     log.info("=== 법령 수집 시작 ===")
     OUTPUT.mkdir(exist_ok=True)
 
-    # ① 매니페스트 로드 (이전 실행의 시행일자 스냅샷)
     manifest = load_manifest()
     log.info(f"매니페스트 로드: {len(manifest)}건 이전 기록")
 
-    # ② 전체 목록 조회 (본문 없이 메타만)
     log.info("목록 조회 중...")
     all_items = collect_all_lists()
     log.info(f"목록 조회 완료: {len(all_items)}건")
 
-    # ③ 변동 여부 판별 → 변경된 건만 본문 수집
     changed_count = 0
     skipped_count = 0
     new_manifest  = {}
@@ -289,15 +352,13 @@ def main():
     for item in all_items:
         mst  = item["mst"]
         date = item["date"]
-        new_manifest[mst] = date   # 항상 최신 시행일자로 갱신
+        new_manifest[mst] = date
 
         if not has_changed(mst, date, manifest):
-            log.debug(f"  스킵(미변경): {item['name']} [{date}]")
             skipped_count += 1
             continue
 
-        # 신규 또는 시행일자 변경 → 본문 재수집
-        action = "신규" if mst not in manifest else f"변경({manifest[mst]}→{date})"
+        action = "신규" if mst not in manifest else f"변경({manifest[mst]}->{date})"
         log.info(f"  [{action}] {item['name']}")
 
         body = fetch_body(item)
@@ -308,15 +369,12 @@ def main():
             log.warning(f"    본문 수집 실패: {item['name']}")
         time.sleep(DELAY_SEC)
 
-    # ④ 결과 로그
     log.info(f"변경 수집: {changed_count}건 / 미변경 스킵: {skipped_count}건")
 
     if changed_count == 0:
-        log.info("변동사항 없음 — 파일 미수정, 커밋 발생하지 않습니다.")
-        # 인덱스·매니페스트도 건드리지 않아 git diff 없음
+        log.info("변동사항 없음 - 파일 미수정, 커밋 발생하지 않습니다.")
         sys.exit(0)
 
-    # ⑤ 변경이 있을 때만 매니페스트·인덱스 업데이트
     save_manifest(new_manifest)
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M KST")
