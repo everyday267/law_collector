@@ -4,15 +4,13 @@ fetch_laws.py
 법제처 국가법령정보 Open API를 이용하여 여객자동차 운수사업법 관련
 법령·행정규칙·자치법규를 Markdown 파일로 수집·저장합니다.
 
-본문조회 식별자 (실측 확정):
-  law    : 법령일련번호  -> MST
-  admrul : 행정규칙일련번호 -> ID
-  ordin  : 자치법규일련번호 -> ID
+변동 감지 방식:
+  docs/manifest.json 에 {mst: 시행일자} 를 보관
+  API에서 받은 시행일자와 비교하여 변경된 건만 본문 재수집
+  변경 없으면 파일 미수정 -> git diff 없음 -> 커밋 없음
 
-본문 XML 구조 (실측 확정):
-  law    : <조문> 안 조문번호/항/호/목
-  admrul : <조문내용> 통짜 텍스트 여러 개
-  ordin  : <조문> 안 <조>(<조제목>/<조내용>) + <부칙>/<부칙내용>
+API 문서: https://open.law.go.kr/LSO/openApi/guideList.do
+실행 전 환경변수 LAW_API_KEY 설정 필요 (OC 값 = 등록 이메일의 앞부분)
 """
 
 import json
@@ -44,7 +42,7 @@ SEARCH_KEYWORDS = ["여객자동차", "노선버스", "준공영제"]
 TARGET_META = {
     "law":    {"item": "law",    "id_tag": "법령일련번호",     "body_key": "MST", "name": "법령명한글",  "region": None},
     "admrul": {"item": "admrul", "id_tag": "행정규칙일련번호", "body_key": "ID",  "name": "행정규칙명",  "region": None},
-    "ordin":  {"item": "law",    "id_tag": "자치법규일련번호", "body_key": "ID",  "name": "자치법규명",  "region": "지자체기관명"},
+    "ordin":  {"item": "law",    "id_tag": "자치법규일련번호", "body_key": "MST", "name": "자치법규명",  "region": "지자체기관명"},
 }
 
 # ─────────────────────────────────────────
@@ -169,6 +167,9 @@ def fetch_body(item: dict):
 
 # ─────────────────────────────────────────
 # XML -> Markdown
+#   law    : <조문> 안에 조문번호/항/호/목 정형 구조
+#   admrul : <조문내용> 통짜 텍스트 여러 개
+#   ordin  : <조문내용> 통짜 텍스트 (행정규칙과 동일 패턴)
 # ─────────────────────────────────────────
 def xml_to_markdown(root: ET.Element) -> str:
     name = (root.findtext(".//법령명한글")
@@ -191,20 +192,11 @@ def xml_to_markdown(root: ET.Element) -> str:
 
     body = []
 
-    # (1) 법령식 정형 구조 <조문> > 조문번호/항/호/목
+    # (1) 법령식 정형 구조 (<조문>)
     for jo in root.iter("조문"):
-        has_jomun = False
-        for child in jo:
-            if child.tag == "조문번호" or child.tag == "조문내용":
-                has_jomun = True
-                break
-        if not has_jomun:
-            continue
         jo_no      = jo.findtext("조문번호") or ""
         jo_title   = jo.findtext("조문제목") or ""
         jo_content = jo.findtext("조문내용") or ""
-        if not (jo_no or jo_content):
-            continue
 
         heading = f"## 제{jo_no}조" + (f" ({jo_title})" if jo_title else "")
         body.append(heading)
@@ -221,31 +213,20 @@ def xml_to_markdown(root: ET.Element) -> str:
                 ho_content = ho.findtext("호내용") or ""
                 if ho_content:
                     body.append(f"  - {ho_no} {_clean(ho_content)}")
+                for mok in ho.iter("목"):
+                    mok_no      = mok.findtext("목번호") or ""
+                    mok_content = mok.findtext("목내용") or ""
+                    if mok_content:
+                        body.append(f"    - {mok_no}) {_clean(mok_content)}")
         body.append("")
 
-    # (2) ordin 식: <조> 안 <조제목>/<조내용>
-    if not body:
-        for jo in root.iter("조"):
-            title   = jo.findtext("조제목") or ""
-            content = jo.findtext("조내용") or ""
-            if not content:
-                continue
-            head = f"## {_clean(content).split(')')[0]})" if content.strip().startswith("제") and ")" in content else (f"## {title}" if title else "##")
-            body.append(f"## {title}" if title else "## 조문")
-            body.append(_clean(content) + "\n")
-        # 부칙
-        for bc in root.iter("부칙내용"):
-            txt = (bc.text or "").strip()
-            if txt:
-                body.append("## 부칙")
-                body.append(_clean(txt) + "\n")
-
-    # (3) admrul 식: <조문내용> 통짜 텍스트
+    # (2) fallback: 행정규칙/자치법규 — <조문내용> 통짜 텍스트
     if not body:
         for jo in root.iter("조문내용"):
             txt = (jo.text or "").strip()
             if not txt:
                 continue
+            # "제N조(제목)" 패턴이면 소제목으로, 아니면 본문 단락으로
             m = re.match(r"^(제\s*\d+조(?:의\d+)?)\s*\(([^)]*)\)\s*(.*)", txt, re.S)
             if m:
                 jo_head, jo_title, rest = m.group(1), m.group(2), m.group(3)
@@ -255,9 +236,11 @@ def xml_to_markdown(root: ET.Element) -> str:
             else:
                 body.append(_clean(txt) + "\n")
 
-    # (4) 최후 fallback
+    # (3) 그래도 비면 부칙 등 다른 텍스트라도 수집
     if not body:
         for el in root.iter():
+            if el.tag.endswith("기본정보"):
+                continue
             if el.text and el.text.strip() and el.tag not in ("행정규칙명", "자치법규명", "법령명한글"):
                 body.append(_clean(el.text))
 
@@ -355,6 +338,7 @@ def main():
         new_manifest[mst] = date
 
         if not has_changed(mst, date, manifest):
+            log.debug(f"  스킵(미변경): {item['name']} [{date}]")
             skipped_count += 1
             continue
 
