@@ -172,61 +172,89 @@ def fetch_body(item: dict):
 #   ordin  : <조문내용> 통짜 텍스트 (행정규칙과 동일 패턴)
 # ─────────────────────────────────────────
 def xml_to_markdown(root: ET.Element) -> str:
-    name = (root.findtext(".//법령명한글")
+    info = root.find("자치법규기본정보")
+    name = ((info.findtext("자치법규명") if info is not None else None)
+            or root.findtext(".//법령명한글")
             or root.findtext(".//행정규칙명")
-            or root.findtext(".//자치법규명")
             or "법령")
-    promulgation = root.findtext(".//공포일자") or root.findtext(".//발령일자") or ""
-    enforcement  = root.findtext(".//시행일자") or ""
-    law_no       = (root.findtext(".//법령번호")
+    promulgation = ((info.findtext("공포일자") if info is not None else None)
+                    or root.findtext(".//공포일자")
+                    or root.findtext(".//발령일자") or "")
+    enforcement  = ((info.findtext("시행일자") if info is not None else None)
+                    or root.findtext(".//시행일자") or "")
+    law_no       = ((info.findtext("공포번호") if info is not None else None)
+                    or root.findtext(".//법령번호")
                     or root.findtext(".//공포번호")
                     or root.findtext(".//발령번호") or "")
+    region       = (info.findtext("지자체기관명") if info is not None else "") or ""
 
-    lines = [
-        f"# {name}\n",
+    lines = [f"# {name}\n"]
+    if region:
+        lines.append(f"> **지자체** {region}  ")
+    lines.extend([
         f"> **법령번호** {law_no}  ",
         f"> **공포일자** {_fmt_date(promulgation)}  ",
         f"> **시행일자** {_fmt_date(enforcement)}\n",
         "---\n",
-    ]
+    ])
 
     body = []
 
-    # (1) 법령식 정형 구조 (<조문>)
-    for jo in root.iter("조문"):
-        jo_no      = jo.findtext("조문번호") or ""
-        jo_title   = jo.findtext("조문제목") or ""
-        jo_content = jo.findtext("조문내용") or ""
+    # (1) 자치법규 정형 구조: <조문> 컨테이너 안의 <조>
+    jo_container = root.find("조문")
+    if jo_container is not None:
+        for jo in jo_container.findall("조"):
+            jo_title   = jo.findtext("조제목") or ""
+            jo_content = jo.findtext("조내용") or ""
+            if not jo_content.strip():
+                continue
+            txt = _clean(jo_content)
+            if not jo_title and re.match(r"^제\d+[장절]", txt):
+                body.append(f"\n### {txt}\n")
+                continue
+            m = re.match(r"^(제\s*\d+조(?:의\d+)?)\s*(?:\(([^)]*)\))?\s*(.*)", txt, re.S)
+            if m:
+                jo_head, parsed_title, rest = m.group(1), m.group(2), m.group(3)
+                title = parsed_title or jo_title
+                body.append(f"## {jo_head}" + (f" ({title})" if title else ""))
+                if rest.strip():
+                    body.append(rest.strip() + "\n")
+            else:
+                body.append(txt + "\n")
 
-        heading = f"## 제{jo_no}조" + (f" ({jo_title})" if jo_title else "")
-        body.append(heading)
-        if jo_content:
-            body.append(_clean(jo_content) + "\n")
+    # (2) 법령식 정형 구조 (<조문>)
+    if not body:
+        for jo in root.iter("조문"):
+            jo_no      = jo.findtext("조문번호") or ""
+            jo_title   = jo.findtext("조문제목") or ""
+            jo_content = jo.findtext("조문내용") or ""
+            heading = f"## 제{jo_no}조" + (f" ({jo_title})" if jo_title else "")
+            body.append(heading)
+            if jo_content:
+                body.append(_clean(jo_content) + "\n")
+            for hang in jo.iter("항"):
+                hang_no      = hang.findtext("항번호") or ""
+                hang_content = hang.findtext("항내용") or ""
+                if hang_content:
+                    body.append(f"**{hang_no}항** {_clean(hang_content)}")
+                for ho in hang.iter("호"):
+                    ho_no      = ho.findtext("호번호") or ""
+                    ho_content = ho.findtext("호내용") or ""
+                    if ho_content:
+                        body.append(f"  - {ho_no} {_clean(ho_content)}")
+                    for mok in ho.iter("목"):
+                        mok_no      = mok.findtext("목번호") or ""
+                        mok_content = mok.findtext("목내용") or ""
+                        if mok_content:
+                            body.append(f"    - {mok_no}) {_clean(mok_content)}")
+            body.append("")
 
-        for hang in jo.iter("항"):
-            hang_no      = hang.findtext("항번호") or ""
-            hang_content = hang.findtext("항내용") or ""
-            if hang_content:
-                body.append(f"**{hang_no}항** {_clean(hang_content)}")
-            for ho in hang.iter("호"):
-                ho_no      = ho.findtext("호번호") or ""
-                ho_content = ho.findtext("호내용") or ""
-                if ho_content:
-                    body.append(f"  - {ho_no} {_clean(ho_content)}")
-                for mok in ho.iter("목"):
-                    mok_no      = mok.findtext("목번호") or ""
-                    mok_content = mok.findtext("목내용") or ""
-                    if mok_content:
-                        body.append(f"    - {mok_no}) {_clean(mok_content)}")
-        body.append("")
-
-    # (2) fallback: 행정규칙/자치법규 — <조문내용> 통짜 텍스트
+    # (3) fallback: 행정규칙 — <조문내용> 통짜 텍스트
     if not body:
         for jo in root.iter("조문내용"):
             txt = (jo.text or "").strip()
             if not txt:
                 continue
-            # "제N조(제목)" 패턴이면 소제목으로, 아니면 본문 단락으로
             m = re.match(r"^(제\s*\d+조(?:의\d+)?)\s*\(([^)]*)\)\s*(.*)", txt, re.S)
             if m:
                 jo_head, jo_title, rest = m.group(1), m.group(2), m.group(3)
@@ -236,13 +264,21 @@ def xml_to_markdown(root: ET.Element) -> str:
             else:
                 body.append(_clean(txt) + "\n")
 
-    # (3) 그래도 비면 부칙 등 다른 텍스트라도 수집
+    # (4) 그래도 비면 부칙 등 다른 텍스트라도 수집
     if not body:
         for el in root.iter():
             if el.tag.endswith("기본정보"):
                 continue
-            if el.text and el.text.strip() and el.tag not in ("행정규칙명", "자치법규명", "법령명한글"):
+            if el.text and el.text.strip() and el.tag not in (
+                    "행정규칙명", "자치법규명", "법령명한글"):
                 body.append(_clean(el.text))
+
+    boochik = root.find("부칙")
+    if boochik is not None:
+        boochik_text = boochik.findtext("부칙내용") or ""
+        if boochik_text.strip():
+            body.append("\n---\n## 부칙\n")
+            body.append(_clean(boochik_text) + "\n")
 
     lines += body
     return "\n".join(lines)
