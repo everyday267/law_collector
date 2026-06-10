@@ -4,10 +4,14 @@ fetch_laws.py
 법제처 국가법령정보 Open API를 이용하여 여객자동차 운수사업법 관련
 법령·행정규칙·자치법규를 Markdown 파일로 수집·저장합니다.
 
-변동 감지 방식:
-  docs/manifest.json 에 {mst: 시행일자} 를 보관
-  API에서 받은 시행일자와 비교하여 변경된 건만 본문 재수집
-  변경 없으면 파일 미수정 -> git diff 없음 -> 커밋 없음
+저장 구조:
+  docs/{YYYYMMDD}/{target}/{파일명}.md   ← 날짜별 폴더
+  docs/{YYYYMMDD}/manifest.json          ← 날짜별 변동 감지
+  docs/{YYYYMMDD}/README.md              ← 날짜별 인덱스
+
+변동 감지 방식 (의도 C):
+  날짜가 바뀌면 항상 새로 전체 수집 (새 날짜 폴더 생성)
+  같은 날 재실행 시에만 manifest로 중복 스킵
 
 API 문서: https://open.law.go.kr/LSO/openApi/guideList.do
 실행 전 환경변수 LAW_API_KEY 설정 필요 (OC 값 = 등록 이메일의 앞부분)
@@ -31,10 +35,13 @@ import requests
 API_KEY   = os.environ["LAW_API_KEY"]
 BASE_URL  = "https://www.law.go.kr/DRF"
 OUTPUT    = Path("docs")
-MANIFEST  = OUTPUT / "manifest.json"
 DELAY_SEC = 0.5
 RETRIES   = 3
 LOG_LEVEL = logging.INFO
+
+TODAY     = datetime.now().strftime("%Y%m%d")
+TODAY_DIR = OUTPUT / TODAY
+MANIFEST  = TODAY_DIR / "manifest.json"   # 날짜별 manifest
 
 SEARCH_KEYWORDS = ["여객자동차", "노선버스", "준공영제"]
 
@@ -60,7 +67,7 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────
-# 매니페스트 (변동 감지)
+# 매니페스트 (변동 감지 - 날짜별)
 # ─────────────────────────────────────────
 def load_manifest() -> dict:
     if MANIFEST.exists():
@@ -69,7 +76,7 @@ def load_manifest() -> dict:
 
 
 def save_manifest(manifest: dict):
-    OUTPUT.mkdir(exist_ok=True)
+    TODAY_DIR.mkdir(parents=True, exist_ok=True)
     MANIFEST.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -167,9 +174,6 @@ def fetch_body(item: dict):
 
 # ─────────────────────────────────────────
 # XML -> Markdown
-#   law    : <조문> 안에 조문번호/항/호/목 정형 구조
-#   admrul : <조문내용> 통짜 텍스트 여러 개
-#   ordin  : <조문내용> 통짜 텍스트 (행정규칙과 동일 패턴)
 # ─────────────────────────────────────────
 def xml_to_markdown(root: ET.Element) -> str:
     info = root.find("자치법규기본정보")
@@ -288,10 +292,10 @@ def xml_to_markdown(root: ET.Element) -> str:
 # 저장 / 인덱스
 # ─────────────────────────────────────────
 def save_markdown(subdir: str, filename: str, content: str):
-    path = OUTPUT / subdir
+    path = TODAY_DIR / subdir
     path.mkdir(parents=True, exist_ok=True)
     (path / filename).write_text(content, encoding="utf-8")
-    log.info(f"    저장: {subdir}/{filename}")
+    log.info(f"    저장: {TODAY}/{subdir}/{filename}")
 
 
 def build_index(all_items: list, generated_at: str,
@@ -355,10 +359,12 @@ def deduplicate(items: list) -> list:
 # ─────────────────────────────────────────
 def main():
     log.info("=== 법령 수집 시작 ===")
+    log.info(f"오늘 날짜 폴더: docs/{TODAY}/")
     OUTPUT.mkdir(exist_ok=True)
+    TODAY_DIR.mkdir(parents=True, exist_ok=True)
 
     manifest = load_manifest()
-    log.info(f"매니페스트 로드: {len(manifest)}건 이전 기록")
+    log.info(f"매니페스트 로드: {len(manifest)}건 이전 기록 (docs/{TODAY}/manifest.json)")
 
     log.info("목록 조회 중...")
     all_items = collect_all_lists()
@@ -399,8 +405,8 @@ def main():
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M KST")
     index_md = build_index(all_items, generated_at, changed_count, skipped_count)
-    (OUTPUT / "README.md").write_text(index_md, encoding="utf-8")
-    log.info("인덱스(docs/README.md) 갱신 완료")
+    (TODAY_DIR / "README.md").write_text(index_md, encoding="utf-8")
+    log.info(f"인덱스(docs/{TODAY}/README.md) 갱신 완료")
 
     log.info("=== 완료 ===")
 
