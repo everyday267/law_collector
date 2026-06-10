@@ -43,7 +43,7 @@ TODAY     = datetime.now().strftime("%Y%m%d")
 TODAY_DIR = OUTPUT / TODAY
 MANIFEST  = TODAY_DIR / "manifest.json"   # 날짜별 manifest
 
-SEARCH_KEYWORDS = ["여객자동차", "노선버스", "준공영제"]
+SEARCH_KEYWORDS = ["여객자동차", "노선버스", "준공영제"] #검색키워드
 
 # target별 메타 (실측 확정)
 TARGET_META = {
