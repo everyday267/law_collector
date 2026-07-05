@@ -43,25 +43,22 @@ jobs:
       - name: Clear existing docs (force refresh)
         if: ${{ github.event.inputs.force_refresh == 'true' }}
         run: |
-          rm -rf docs/law docs/admrul docs/ordin docs/.manifest.json
-          echo "기존 본문 파일 및 매니페스트 삭제 완료"
+          # 오늘(KST) 날짜 폴더를 삭제해 같은 날 전체 재수집을 강제
+          TODAY=$(TZ=Asia/Seoul date +%Y%m%d)
+          rm -rf "docs/${TODAY}"
+          echo "docs/${TODAY} 삭제 완료 — 전체 재수집합니다"
 
       - name: Fetch laws
-        id: fetch
         env:
           LAW_API_KEY: ${{ secrets.LAW_API_KEY }}
-        run: |
-          python scripts/fetch_laws.py
-          # 스크립트가 종료 코드 2를 반환하면 "변경 없음"
-          echo "exit_code=$?" >> $GITHUB_OUTPUT
-        continue-on-error: true
+        run: python scripts/fetch_laws.py
 
       - name: Commit and push (변경 시에만)
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add docs/ fetch_laws.log
+          git add docs/
           if git diff --cached --quiet; then
             echo "변경된 파일 없음 — 커밋 스킵"
           else
@@ -76,9 +73,12 @@ jobs:
         run: |
           echo "### 수집 결과" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          LAW_CNT=$(find docs/law    -name "*.md" 2>/dev/null | wc -l || echo 0)
-          ADM_CNT=$(find docs/admrul -name "*.md" 2>/dev/null | wc -l || echo 0)
-          ORD_CNT=$(find docs/ordin  -name "*.md" 2>/dev/null | wc -l || echo 0)
+          # 최신 날짜 폴더(docs/YYYYMMDD) 기준 집계
+          LATEST=$(ls -d docs/2* 2>/dev/null | sort | tail -1)
+          echo "집계 대상: ${LATEST}" >> $GITHUB_STEP_SUMMARY
+          LAW_CNT=$(find "${LATEST}/law"    -name "*.md" 2>/dev/null | wc -l || echo 0)
+          ADM_CNT=$(find "${LATEST}/admrul" -name "*.md" 2>/dev/null | wc -l || echo 0)
+          ORD_CNT=$(find "${LATEST}/ordin"  -name "*.md" 2>/dev/null | wc -l || echo 0)
           TOTAL=$((LAW_CNT + ADM_CNT + ORD_CNT))
           echo "| 구분 | 건수 |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY

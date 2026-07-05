@@ -26,6 +26,7 @@ import logging
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -39,7 +40,9 @@ DELAY_SEC = 0.5
 RETRIES   = 3
 LOG_LEVEL = logging.INFO
 
-TODAY     = datetime.now().strftime("%Y%m%d")
+# GitHub Actions 러너는 UTC — 날짜 폴더가 한국 기준과 어긋나지 않도록 KST 고정
+KST       = ZoneInfo("Asia/Seoul")
+TODAY     = datetime.now(KST).strftime("%Y%m%d")
 TODAY_DIR = OUTPUT / TODAY
 MANIFEST  = TODAY_DIR / "manifest.json"   # 날짜별 manifest
 
@@ -104,6 +107,11 @@ def api_get(endpoint: str, params: dict):
             wait = 2 * (attempt + 1)
             log.warning(f"연결 끊김 [{endpoint}] {attempt+1}/{RETRIES} - {wait}s 후 재시도")
             time.sleep(wait)
+        except ET.ParseError as e:
+            # API 키 무효/권한 미신청 시 HTTP 200 + HTML이 오는 경우가 있음
+            log.warning(f"XML 파싱 실패 [{endpoint}] params={params}: {e} "
+                        f"— 응답 시작: {resp.text[:200]!r}")
+            return None
         except Exception as e:
             log.warning(f"API 호출 실패 [{endpoint}] params={params}: {e}")
             return None
@@ -314,7 +322,7 @@ def build_index(all_items: list, generated_at: str,
         lines.append("| 법령명 | 시행일 | 파일 |")
         lines.append("|---|---|---|")
         for item in sorted(subset, key=lambda x: x["name"]):
-            fn     = safe_filename(item["name"]) + ".md"
+            fn     = item_filename(item)
             region = f" ({item['region']})" if item.get("region") else ""
             link   = f"[{item['name']}{region}](./{cat}/{fn})"
             lines.append(f"| {link} | {_fmt_date(item['date'])} | `{fn}` |")
@@ -342,6 +350,14 @@ def _fmt_date(d: str) -> str:
 
 def safe_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", name)[:100]
+
+
+def item_filename(item: dict) -> str:
+    # 지자체가 다른 동명 조례가 서로 덮어쓰지 않도록 지역명을 파일명에 포함
+    name = item["name"]
+    if item.get("region"):
+        name += f" ({item['region']})"
+    return safe_filename(name) + ".md"
 
 
 def deduplicate(items: list) -> list:
@@ -372,15 +388,16 @@ def main():
 
     changed_count = 0
     skipped_count = 0
+    failed_count  = 0
     new_manifest  = {}
 
     for item in all_items:
         mst  = item["mst"]
         date = item["date"]
-        new_manifest[mst] = date
 
         if not has_changed(mst, date, manifest):
             log.debug(f"  스킵(미변경): {item['name']} [{date}]")
+            new_manifest[mst] = date
             skipped_count += 1
             continue
 
@@ -389,13 +406,18 @@ def main():
 
         body = fetch_body(item)
         if body:
-            save_markdown(item["type"], safe_filename(item["name"]) + ".md", body)
+            save_markdown(item["type"], item_filename(item), body)
+            # 저장 성공 후에만 기록 — 실패 항목이 재실행에서 스킵되지 않도록
+            new_manifest[mst] = date
             changed_count += 1
         else:
             log.warning(f"    본문 수집 실패: {item['name']}")
+            failed_count += 1
         time.sleep(DELAY_SEC)
 
-    log.info(f"변경 수집: {changed_count}건 / 미변경 스킵: {skipped_count}건")
+    log.info(f"변경 수집: {changed_count}건 / 미변경 스킵: {skipped_count}건 / 실패: {failed_count}건")
+    if failed_count:
+        log.warning(f"본문 수집 실패 {failed_count}건 — 같은 날 재실행하면 실패분만 재시도됩니다.")
 
     if changed_count == 0:
         log.info("변동사항 없음 - 파일 미수정, 커밋 발생하지 않습니다.")
@@ -403,7 +425,7 @@ def main():
 
     save_manifest(new_manifest)
 
-    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M KST")
+    generated_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
     index_md = build_index(all_items, generated_at, changed_count, skipped_count)
     (TODAY_DIR / "README.md").write_text(index_md, encoding="utf-8")
     log.info(f"인덱스(docs/{TODAY}/README.md) 갱신 완료")
