@@ -12,7 +12,9 @@ cd "$REPO_DIR"
 # ── 1. API 키 확인 ─────────────────────────
 if [ -z "$LAW_API_KEY" ]; then
   if [ -f ".env" ]; then
-    export $(grep -v '^#' .env | xargs)
+    set -a
+    source .env
+    set +a
     echo "[INFO] .env 에서 API 키 로드"
   else
     echo "[ERROR] LAW_API_KEY 가 설정되지 않았습니다."
@@ -37,12 +39,12 @@ fi
 
 # ── 4. Git push ─────────────────────────────
 echo "[INFO] 변경사항 push 중..."
-TIMESTAMP=$(date "+%Y-%m-%d %H:%M KST")
+TIMESTAMP=$(TZ=Asia/Seoul date "+%Y-%m-%d %H:%M KST")
 CHANGED=$(git diff --name-only docs/ | grep -c "\.md$" || true)
 NEW=$(git ls-files --others --exclude-standard docs/ | grep -c "\.md$" || true)
 TOTAL=$((CHANGED + NEW))
 
-git add docs/ fetch_laws.log
+git add docs/
 git commit -m "chore: 법령 수집 ${TIMESTAMP} (변경 ${TOTAL}건)"
 git push
 
